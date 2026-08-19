@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: bqml-gate
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
