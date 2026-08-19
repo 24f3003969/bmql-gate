@@ -789,7 +789,8 @@ function validateEvaluationInput(body) {
 
     if (
         typeof body.runId !== "string" ||
-        body.runId.length === 0
+        body.runId.length === 0 ||
+        body.runId.length > 128
     ) {
         return false;
     }
@@ -854,17 +855,31 @@ function validateEvaluationInput(body) {
    ========================================================= */
 
 function processEvaluation(body) {
+    const runId =
+        typeof body?.runId === "string"
+            ? body.runId
+            : "";
+    const selectedTrialId =
+        isSafeNonNegativeInteger(body?.selectedTrialId)
+            ? body.selectedTrialId
+            : null;
+    const datasetDigest =
+        typeof body?.datasetDigest === "string"
+            ? body.datasetDigest
+            : null;
+    const bytesProcessed =
+        isSafeNonNegativeInteger(body?.bytesProcessed)
+            ? body.bytesProcessed
+            : null;
+
     const output = {
-        runId: body.runId,
-        selectedTrialId:
-            body.selectedTrialId,
-        datasetDigest:
-            body.datasetDigest,
+        runId,
+        selectedTrialId,
+        datasetDigest,
         testMetric: null,
         criticalSlicePass: false,
         decision: "reject",
-        bytesProcessed:
-            body.bytesProcessed,
+        bytesProcessed,
         reasonCodes: []
     };
 
@@ -874,13 +889,7 @@ function processEvaluation(body) {
      * Input validation.
      */
     if (!validateEvaluationInput(body)) {
-        reasons.push("INVALID_INPUT");
-
-        output.reasonCodes =
-            sortAndDeduplicateCodes(
-                reasons
-            );
-
+        output.reasonCodes = ["INVALID_INPUT"];
         return output;
     }
 
@@ -937,29 +946,46 @@ function processEvaluation(body) {
     }
 
     /*
-     * Empty rows OR invalid rows:
-     *
-     * - testMetric = null
-     * - skip aggregate checks
-     * - skip slice checks
-     * - lineage and byte checks still apply
+     * Invalid rows prevent metric computation.
      */
-    if (
-        body.rows.length === 0 ||
-        invalidTestRow
-    ) {
+    if (invalidTestRow) {
         output.testMetric = null;
         output.criticalSlicePass = false;
-
+        output.decision = "reject";
         output.reasonCodes =
             sortAndDeduplicateCodes(
                 reasons
             );
 
-        /*
-         * No valid final-test evaluation can be admitted.
-         */
+        return output;
+    }
+
+    /*
+     * Empty rows: check required slices and metric floor.
+     */
+    if (body.rows.length === 0) {
+        output.testMetric = null;
+        output.criticalSlicePass = false;
+
+        for (const sliceName of Object.keys(
+            body.requiredSlices
+        )) {
+            reasons.push(
+                `MISSING_SLICE:${sliceName}`
+            );
+        }
+
+        if (body.metricFloor > 0) {
+            reasons.push(
+                "AGGREGATE_FLOOR"
+            );
+        }
+
         output.decision = "reject";
+        output.reasonCodes =
+            sortAndDeduplicateCodes(
+                reasons
+            );
 
         return output;
     }
@@ -1056,51 +1082,19 @@ function processEvaluation(body) {
     /*
      * criticalSlicePass is about the required-slice gate,
      * not aggregate accuracy or bytes.
-     *
-     * Therefore aggregate failure and byte failure do NOT
-     * by themselves make criticalSlicePass false.
      */
     output.criticalSlicePass =
         allRequiredSlicesPass;
-
-    /*
-     * Admission requires ALL gates:
-     *
-     * - valid input
-     * - valid lineage
-     * - valid test rows
-     * - aggregate floor
-     * - every required slice
-     * - every required slice floor
-     * - byte limit
-     */
-    if (
-        !reasons.includes(
-            "INVALID_INPUT"
-        ) &&
-        !reasons.includes(
-            "INVALID_LINEAGE"
-        ) &&
-        !reasons.includes(
-            "INVALID_TEST_ROW"
-        ) &&
-        !reasons.includes(
-            "AGGREGATE_FLOOR"
-        ) &&
-        !reasons.includes(
-            "BYTE_LIMIT"
-        ) &&
-        allRequiredSlicesPass
-    ) {
-        output.decision = "admit";
-    } else {
-        output.decision = "reject";
-    }
 
     output.reasonCodes =
         sortAndDeduplicateCodes(
             reasons
         );
+
+    output.decision =
+        output.reasonCodes.length === 0
+            ? "admit"
+            : "reject";
 
     return output;
 }
