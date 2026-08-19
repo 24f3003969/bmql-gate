@@ -1,402 +1,513 @@
 const express = require("express");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// In-memory state.
-// On Render free instances this resets after restart/redeploy.
-const runs = new Map();
+const DB_FILE = path.join(__dirname, "storage.json");
+
+function loadDb() {
+    if (!fs.existsSync(DB_FILE)) {
+        return { selections: {} };
+    }
+
+    try {
+        return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+    } catch {
+        return { selections: {} };
+    }
+}
+
+function saveDb(db) {
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+const db = loadDb();
 
 function utf8Compare(a, b) {
-  return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+    return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
 }
 
-function sortUtf8(arr) {
-  return [...arr].sort(utf8Compare);
+function uniqueSorted(arr) {
+    return [...new Set(arr)].sort(utf8Compare);
 }
 
-function isSafeNonNegativeInt(v) {
-  return Number.isSafeInteger(v) && v >= 0;
+function sha256(text) {
+    return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+function round12(x) {
+    return Number(x.toFixed(12));
+}
+
+function isSafeNonNegativeInteger(v) {
+    return Number.isSafeInteger(v) && v >= 0;
 }
 
 function isFiniteNumber(v) {
-  return typeof v === "number" && Number.isFinite(v);
+    return typeof v === "number" && Number.isFinite(v);
 }
 
-function validTimestamp(s) {
-  if (typeof s !== "string") return false;
-  const re =
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
-  if (!re.test(s)) return false;
-  return !Number.isNaN(Date.parse(s));
+function validTimestamp(ts) {
+    if (typeof ts !== "string") return false;
+
+    const regex =
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+\-]\d{2}:\d{2})$/;
+
+    if (!regex.test(ts)) return false;
+
+    const d = new Date(ts);
+
+    return !Number.isNaN(d.getTime());
 }
 
-function compactDigest(trainRowIds, evalRowIds, featureNames) {
-  const obj = { trainRowIds, evalRowIds, featureNames };
-  const json = JSON.stringify(obj);
-  return crypto.createHash("sha256").update(json).digest("hex");
+function compactJson(obj) {
+    return JSON.stringify(obj);
 }
 
-function invalidSelection(runId) {
-  return {
-    runId,
-    selectedTrialId: null,
-    trainRowIds: [],
-    evalRowIds: [],
-    featureNames: [],
-    datasetDigest: null,
-    reasonCodes: ["INVALID_INPUT"]
-  };
-}
-
-function validateSelection(body) {
-  if (!body || body.phase !== "select") return false;
-
-  if (
-    typeof body.runId !== "string" ||
-    body.runId.length === 0 ||
-    body.runId.length > 128
-  )
-    return false;
-
-  if (!Array.isArray(body.forbiddenFeatures)) return false;
-
-  if (
-    !Number.isSafeInteger(body.numTrialsLimit) ||
-    body.numTrialsLimit <= 0
-  )
-    return false;
-
-  if (!Array.isArray(body.rows) || body.rows.length === 0) return false;
-  if (!Array.isArray(body.trials)) return false;
-
-  const rowIds = new Set();
-  for (const r of body.rows) {
-    if (!r || typeof r.id !== "string" || typeof r.entity !== "string")
-      return false;
-    if (rowIds.has(r.id)) return false;
-    rowIds.add(r.id);
-
-    if (!validTimestamp(r.eventTime) || !validTimestamp(r.predictionTime))
-      return false;
-
-    if (!isSafeNonNegativeInt(r.version)) return false;
-
-    if (r.split !== "TRAIN" && r.split !== "EVAL") return false;
-
-    if (!r.features || typeof r.features !== "object") return false;
-
-    for (const f of Object.values(r.features)) {
-      if (!f || typeof f !== "object") return false;
-      if (!validTimestamp(f.availableAt)) return false;
-    }
-  }
-
-  const trialIds = new Set();
-  for (const t of body.trials) {
-    if (!t || !isSafeNonNegativeInt(t.trialId)) return false;
-    if (trialIds.has(t.trialId)) return false;
-    trialIds.add(t.trialId);
-
-    if (t.status !== "SUCCEEDED" && t.status !== "FAILED") return false;
-  }
-
-  return true;
-}
-
-function select(body) {
-  const runId = body.runId;
-
-  if (!validateSelection(body)) {
-    return invalidSelection(runId);
-  }
-
-  if (body.trials.length > body.numTrialsLimit) {
+function invalidSelectionResponse(runId) {
     return {
-      runId,
-      selectedTrialId: null,
-      trainRowIds: [],
-      evalRowIds: [],
-      featureNames: [],
-      datasetDigest: null,
-      reasonCodes: ["TRIAL_LIMIT_EXCEEDED"]
+        runId: runId || "",
+        selectedTrialId: null,
+        trainRowIds: [],
+        evalRowIds: [],
+        featureNames: [],
+        datasetDigest: null,
+        reasonCodes: ["INVALID_INPUT"]
     };
-  }
+}
 
-  const dedup = new Map();
+function sortCodes(codes) {
+    return uniqueSorted(codes);
+}
 
-  for (const r of body.rows) {
-    const key = `${r.entity}\u0000${new Date(r.eventTime).toISOString()}`;
-    const old = dedup.get(key);
+function validateSelectionPayload(body) {
+    try {
+        if (body.phase !== "select") return false;
+
+        if (
+            typeof body.runId !== "string" ||
+            body.runId.length === 0 ||
+            body.runId.length > 128
+        ) {
+            return false;
+        }
+
+        if (!Array.isArray(body.rows) || body.rows.length === 0) {
+            return false;
+        }
+
+        if (!Array.isArray(body.trials)) {
+            return false;
+        }
+
+        if (
+            !Number.isInteger(body.numTrialsLimit) ||
+            body.numTrialsLimit <= 0
+        ) {
+            return false;
+        }
+
+        if (!Array.isArray(body.forbiddenFeatures)) {
+            return false;
+        }
+
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function canonicalSelectionInput(body) {
+    return JSON.stringify(body);
+}
+
+function processSelection(body) {
+    const result = {
+        runId: body.runId,
+        selectedTrialId: null,
+        trainRowIds: [],
+        evalRowIds: [],
+        featureNames: [],
+        datasetDigest: null,
+        reasonCodes: []
+    };
+
+    const reasons = [];
+
+    if (!validateSelectionPayload(body)) {
+        result.reasonCodes = ["INVALID_INPUT"];
+        return result;
+    }
+
+    if (body.trials.length > body.numTrialsLimit) {
+        reasons.push("TRIAL_LIMIT_EXCEEDED");
+    }
+
+    const dedupMap = new Map();
+
+    for (const row of body.rows) {
+        try {
+            if (
+                typeof row.id !== "string" ||
+                typeof row.entity !== "string" ||
+                !validTimestamp(row.eventTime) ||
+                !validTimestamp(row.predictionTime) ||
+                !isSafeNonNegativeInteger(row.version) ||
+                !["TRAIN", "EVAL"].includes(row.split) ||
+                typeof row.features !== "object" ||
+                row.features === null
+            ) {
+                reasons.push("INVALID_INPUT");
+                continue;
+            }
+
+            const utcEvent = new Date(row.eventTime).toISOString();
+
+            const key = `${row.entity}||${utcEvent}`;
+
+            const existing = dedupMap.get(key);
+
+            if (!existing) {
+                dedupMap.set(key, row);
+            } else {
+                if (row.version > existing.version) {
+                    dedupMap.set(key, row);
+                } else if (row.version === existing.version) {
+                    if (utf8Compare(row.id, existing.id) < 0) {
+                        dedupMap.set(key, row);
+                    }
+                }
+            }
+        } catch {
+            reasons.push("INVALID_INPUT");
+        }
+    }
+
+    const retainedRows = [...dedupMap.values()];
+
+    if (retainedRows.length === 0) {
+        reasons.push("INVALID_INPUT");
+    }
+
+    let featureNames = [];
+
+    if (retainedRows.length > 0) {
+        let common = null;
+
+        for (const row of retainedRows) {
+            const predictionTime = new Date(row.predictionTime).getTime();
+
+            const eligible = new Set();
+
+            for (const [name, feature] of Object.entries(row.features)) {
+                if (body.forbiddenFeatures.includes(name)) continue;
+
+                if (
+                    !feature ||
+                    typeof feature !== "object" ||
+                    !validTimestamp(feature.availableAt)
+                ) {
+                    continue;
+                }
+
+                if (
+                    new Date(feature.availableAt).getTime() <= predictionTime
+                ) {
+                    eligible.add(name);
+                }
+            }
+
+            if (common === null) {
+                common = eligible;
+            } else {
+                common = new Set(
+                    [...common].filter(x => eligible.has(x))
+                );
+            }
+        }
+
+        featureNames = [...(common || [])].sort(utf8Compare);
+    }
+
+    const trainRowIds = retainedRows
+        .filter(r => r.split === "TRAIN")
+        .map(r => r.id)
+        .sort(utf8Compare);
+
+    const evalRowIds = retainedRows
+        .filter(r => r.split === "EVAL")
+        .map(r => r.id)
+        .sort(utf8Compare);
+
+    result.trainRowIds = trainRowIds;
+    result.evalRowIds = evalRowIds;
+    result.featureNames = featureNames;
+
+    if (!reasons.includes("INVALID_INPUT")) {
+        const digestInput = {
+            trainRowIds,
+            evalRowIds,
+            featureNames
+        };
+
+        result.datasetDigest = sha256(
+            compactJson(digestInput)
+        );
+    }
+
+    const eligibleTrials = body.trials.filter(
+        t =>
+            t.status === "SUCCEEDED" &&
+            isFiniteNumber(t.evalMetric)
+    );
 
     if (
-      !old ||
-      r.version > old.version ||
-      (r.version === old.version && utf8Compare(r.id, old.id) < 0)
+        !reasons.includes("TRIAL_LIMIT_EXCEEDED") &&
+        !reasons.includes("INVALID_INPUT")
     ) {
-      dedup.set(key, r);
+        if (eligibleTrials.length === 0) {
+            reasons.push("NO_SUCCESSFUL_TRIAL");
+        } else {
+            eligibleTrials.sort((a, b) => {
+                if (b.evalMetric !== a.evalMetric) {
+                    return b.evalMetric - a.evalMetric;
+                }
+
+                return a.trialId - b.trialId;
+            });
+
+            result.selectedTrialId =
+                eligibleTrials[0].trialId;
+        }
     }
-  }
 
-  const retained = [...dedup.values()];
+    if (reasons.length > 0) {
+        result.selectedTrialId = null;
 
-  let eligibleFeatures = null;
-
-  for (const row of retained) {
-    const names = Object.keys(row.features);
-
-    const good = new Set(
-      names.filter(
-        (name) =>
-          !body.forbiddenFeatures.includes(name) &&
-          new Date(row.features[name].availableAt) <=
-            new Date(row.predictionTime)
-      )
-    );
-
-    if (eligibleFeatures === null) {
-      eligibleFeatures = good;
-    } else {
-      eligibleFeatures = new Set(
-        [...eligibleFeatures].filter((x) => good.has(x))
-      );
+        if (reasons.includes("INVALID_INPUT")) {
+            result.datasetDigest = null;
+        }
     }
-  }
 
-  const featureNames = sortUtf8([...eligibleFeatures]);
+    result.reasonCodes = sortCodes(reasons);
 
-  const trainRowIds = sortUtf8(
-    retained.filter((r) => r.split === "TRAIN").map((r) => r.id)
-  );
+    return result;
+}
 
-  const evalRowIds = sortUtf8(
-    retained.filter((r) => r.split === "EVAL").map((r) => r.id)
-  );
+function validateDigest(d) {
+    return /^[a-f0-9]{64}$/.test(d);
+}
 
-  const succeeded = body.trials.filter(
-    (t) => t.status === "SUCCEEDED" && isFiniteNumber(t.evalMetric)
-  );
+function processEvaluation(body) {
+    const reasons = [];
 
-  if (succeeded.length === 0) {
-    return {
-      runId,
-      selectedTrialId: null,
-      trainRowIds,
-      evalRowIds,
-      featureNames,
-      datasetDigest: null,
-      reasonCodes: ["NO_SUCCESSFUL_TRIAL"]
+    let invalidRowFound = false;
+
+    const output = {
+        runId: body.runId,
+        selectedTrialId: body.selectedTrialId,
+        datasetDigest: body.datasetDigest,
+        testMetric: null,
+        criticalSlicePass: false,
+        decision: "reject",
+        bytesProcessed: body.bytesProcessed,
+        reasonCodes: []
     };
-  }
 
-  succeeded.sort((a, b) => {
-    if (a.evalMetric !== b.evalMetric)
-      return b.evalMetric - a.evalMetric;
-    return a.trialId - b.trialId;
-  });
+    let validInput = true;
 
-  const selectedTrialId = succeeded[0].trialId;
-  const datasetDigest = compactDigest(
-    trainRowIds,
-    evalRowIds,
-    featureNames
-  );
-
-  return {
-    runId,
-    selectedTrialId,
-    trainRowIds,
-    evalRowIds,
-    featureNames,
-    datasetDigest,
-    reasonCodes: []
-  };
-}
-
-function selectionFingerprint(body) {
-  return crypto
-    .createHash("sha256")
-    .update(JSON.stringify(body))
-    .digest("hex");
-}
-
-function evaluate(body) {
-  const runId = body?.runId;
-
-  const codes = [];
-
-  const basicValid =
-    body &&
-    body.phase === "evaluate" &&
-    typeof body.runId === "string" &&
-    body.runId.length > 0 &&
-    body.runId.length <= 128 &&
-    isSafeNonNegativeInt(body.selectedTrialId) &&
-    typeof body.datasetDigest === "string" &&
-    /^[0-9a-f]{64}$/.test(body.datasetDigest) &&
-    isFiniteNumber(body.metricFloor) &&
-    body.metricFloor >= 0 &&
-    body.metricFloor <= 1 &&
-    body.requiredSlices &&
-    typeof body.requiredSlices === "object" &&
-    Array.isArray(body.rows) &&
-    isSafeNonNegativeInt(body.bytesProcessed) &&
-    isSafeNonNegativeInt(body.maxBytes);
-
-  if (!basicValid) {
-    codes.push("INVALID_INPUT");
-  }
-
-  if (basicValid) {
-    for (const v of Object.values(body.requiredSlices)) {
-      if (!isFiniteNumber(v) || v < 0 || v > 1) {
-        codes.push("INVALID_INPUT");
-        break;
-      }
-    }
-  }
-
-  const stored = runs.get(runId);
-
-  if (
-    !stored ||
-    stored.response.selectedTrialId === null ||
-    stored.response.selectedTrialId !== body?.selectedTrialId ||
-    stored.response.datasetDigest !== body?.datasetDigest
-  ) {
-    codes.push("INVALID_LINEAGE");
-  }
-
-  let invalidRow = false;
-
-  if (Array.isArray(body?.rows)) {
-    for (const r of body.rows) {
-      if (
-        !r ||
-        !Number.isInteger(r.label) ||
-        !Number.isInteger(r.prediction) ||
-        (r.label !== 0 && r.label !== 1) ||
-        (r.prediction !== 0 && r.prediction !== 1) ||
-        typeof r.slice !== "string" ||
-        r.slice.length === 0
-      ) {
-        invalidRow = true;
-        break;
-      }
-    }
-  }
-
-  if (invalidRow) codes.push("INVALID_TEST_ROW");
-
-  let testMetric = null;
-  let criticalSlicePass = false;
-
-  if (
-    basicValid &&
-    !invalidRow &&
-    body.rows.length > 0
-  ) {
-    const correct = body.rows.filter(
-      (r) => r.label === r.prediction
-    ).length;
-
-    testMetric = Number(
-      (correct / body.rows.length).toFixed(12)
-    );
-
-    const slices = new Map();
-
-    for (const r of body.rows) {
-      if (!slices.has(r.slice)) slices.set(r.slice, []);
-      slices.get(r.slice).push(r);
+    if (
+        typeof body.runId !== "string" ||
+        !isSafeNonNegativeInteger(body.selectedTrialId) ||
+        !validateDigest(body.datasetDigest) ||
+        !Array.isArray(body.rows)
+    ) {
+        validInput = false;
     }
 
-    criticalSlicePass = true;
+    if (
+        !isFiniteNumber(body.metricFloor) ||
+        body.metricFloor < 0 ||
+        body.metricFloor > 1
+    ) {
+        validInput = false;
+    }
 
-    for (const [name, floor] of Object.entries(
-      body.requiredSlices
-    )) {
-      const rows = slices.get(name);
+    if (
+        !isSafeNonNegativeInteger(body.bytesProcessed) ||
+        !isSafeNonNegativeInteger(body.maxBytes)
+    ) {
+        validInput = false;
+    }
 
-      if (!rows) {
-        codes.push(`MISSING_SLICE:${name}`);
+    if (!validInput) {
+        reasons.push("INVALID_INPUT");
+    }
+
+    const stored = db.selections[body.runId];
+
+    if (
+        !stored ||
+        stored.response.selectedTrialId !== body.selectedTrialId ||
+        stored.response.datasetDigest !== body.datasetDigest
+    ) {
+        reasons.push("INVALID_LINEAGE");
+    }
+
+    for (const row of body.rows || []) {
+        const ok =
+            (row.label === 0 || row.label === 1) &&
+            (row.prediction === 0 || row.prediction === 1) &&
+            typeof row.slice === "string" &&
+            row.slice.length > 0;
+
+        if (!ok) {
+            invalidRowFound = true;
+            break;
+        }
+    }
+
+    if (invalidRowFound) {
+        reasons.push("INVALID_TEST_ROW");
+    }
+
+    if (body.bytesProcessed > body.maxBytes) {
+        reasons.push("BYTE_LIMIT");
+    }
+
+    let criticalSlicePass = true;
+
+    if (
+        body.rows.length === 0 ||
+        invalidRowFound
+    ) {
         criticalSlicePass = false;
-        continue;
-      }
+    } else {
+        const totalCorrect = body.rows.filter(
+            r => r.label === r.prediction
+        ).length;
 
-      const acc = Number(
-        (
-          rows.filter((r) => r.label === r.prediction).length /
-          rows.length
-        ).toFixed(12)
-      );
+        const aggregate =
+            totalCorrect / body.rows.length;
 
-      if (acc < floor) {
-        codes.push(`SLICE_FLOOR:${name}`);
+        output.testMetric = round12(aggregate);
+
+        if (aggregate < body.metricFloor) {
+            reasons.push("AGGREGATE_FLOOR");
+        }
+
+        const requiredSlices =
+            body.requiredSlices || {};
+
+        for (const [slice, floor] of Object.entries(
+            requiredSlices
+        )) {
+            const rows = body.rows.filter(
+                r => r.slice === slice
+            );
+
+            if (rows.length === 0) {
+                reasons.push(`MISSING_SLICE:${slice}`);
+                criticalSlicePass = false;
+                continue;
+            }
+
+            const correct = rows.filter(
+                r => r.label === r.prediction
+            ).length;
+
+            const acc = round12(correct / rows.length);
+
+            if (acc < floor) {
+                reasons.push(`SLICE_FLOOR:${slice}`);
+                criticalSlicePass = false;
+            }
+        }
+    }
+
+    if (
+        reasons.includes("INVALID_INPUT") ||
+        reasons.includes("INVALID_LINEAGE") ||
+        reasons.includes("INVALID_TEST_ROW")
+    ) {
         criticalSlicePass = false;
-      }
     }
 
-    if (testMetric < body.metricFloor) {
-      codes.push("AGGREGATE_FLOOR");
+    output.criticalSlicePass = criticalSlicePass;
+
+    output.reasonCodes = sortCodes(reasons);
+
+    if (output.reasonCodes.length === 0) {
+        output.decision = "admit";
     }
-  }
 
-  if (basicValid && body.bytesProcessed > body.maxBytes) {
-    codes.push("BYTE_LIMIT");
-  }
-
-  const reasonCodes = sortUtf8([...new Set(codes)]);
-
-  const decision =
-    reasonCodes.length === 0 ? "admit" : "reject";
-
-  return {
-    runId,
-    selectedTrialId: body?.selectedTrialId ?? null,
-    datasetDigest: body?.datasetDigest ?? null,
-    testMetric,
-    criticalSlicePass,
-    decision,
-    bytesProcessed: body?.bytesProcessed ?? null,
-    reasonCodes
-  };
+    return output;
 }
 
 app.post("/bqml", (req, res) => {
-  const body = req.body;
+    const body = req.body;
 
-  if (!body || (body.phase !== "select" && body.phase !== "evaluate")) {
-    return res.status(400).json({ error: "INVALID_INPUT" });
-  }
-
-  if (body.phase === "select") {
-    const fp = selectionFingerprint(body);
-    const existing = runs.get(body.runId);
-
-    if (existing) {
-      if (existing.fingerprint === fp) {
-        return res.json(existing.response);
-      }
-      return res.status(409).json({ error: "RUN_ID_CONFLICT" });
+    if (!body || !body.phase) {
+        return res
+            .status(400)
+            .json({ error: "INVALID_INPUT" });
     }
 
-    const response = select(body);
+    if (body.phase === "select") {
+        const runId = body.runId;
 
-    runs.set(body.runId, {
-      fingerprint: fp,
-      response
-    });
+        const existing = db.selections[runId];
 
-    return res.json(response);
-  }
+        if (existing) {
+            const incoming =
+                canonicalSelectionInput(body);
 
-  return res.json(evaluate(body));
+            if (
+                incoming === existing.originalInput
+            ) {
+                return res.json(existing.response);
+            }
+
+            return res
+                .status(409)
+                .json({
+                    error: "RUN_ID_CONFLICT"
+                });
+        }
+
+        const response =
+            processSelection(body);
+
+        db.selections[runId] = {
+            originalInput:
+                canonicalSelectionInput(body),
+            response
+        };
+
+        saveDb(db);
+
+        return res.json(response);
+    }
+
+    if (body.phase === "evaluate") {
+        const response =
+            processEvaluation(body);
+
+        return res.json(response);
+    }
+
+    return res
+        .status(400)
+        .json({ error: "INVALID_INPUT" });
 });
 
 app.listen(PORT, () => {
-  console.log(`BQML gate listening on port ${PORT}`);
+    console.log(
+        `Server listening on ${PORT}`
+    );
 });

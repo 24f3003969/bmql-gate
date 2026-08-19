@@ -1,15 +1,16 @@
 {
   "name": "bqml-gate-service",
   "version": "1.0.0",
-  "description": "Stateful two-phase BQML experiment gate",
+  "description": "Stateful two-phase experiment gate",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "express": "^4.21.2"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }
